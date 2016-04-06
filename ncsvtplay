@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+
+
+"""
+ncsvtplay
+=========
+
+NCurses client for SVT Play
+
+Copyright (C) 2016 Viktor Söderqvist
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+# This class with its imports may be moved to a separate module, but
+# currently everything fits in this one single file.
+import sys
+import subprocess
+from subprocess import PIPE, Popen
+from threading  import Thread
+import queue
+import re
+import os
+class SvtplayDlThread(Thread):
+	"""A thread that executes svtplay-dl and monitors its output"""
+
+	# TODO: For displaying the queue, use locks and deque instead of queue.Queue
+
+	def __init__(self, player):
+		Thread.__init__(self)
+		self.daemon = True # thread dies with the program
+		self.job_queue = queue.Queue()
+		self.done_queue = queue.Queue()
+		self.current_job = None
+		self.message = ''
+		self.proc = None
+		self.local_file = None
+		self.player_thread = None
+		if player != None:
+			self.player_thread = PlayerThread(player)
+
+	def add_job(self, url):
+		self.job_queue.put(url)
+
+	def kill_current(self):
+		"""Kills currently running job (not thread safe...)"""
+		if self.proc:
+			self.proc.kill()
+		if self.local_file:
+			os.remove(self.local_file)
+		self.local_file = None
+		self.current_job = None
+		self.proc = None
+
+	def fetch_done_jobs(self):
+		jobs = []
+		while True:
+			try:
+				job = self.done_queue.get_nowait()
+			except queue.Empty:
+				return jobs
+			else:
+				jobs.append(job)
+
+	def run(self):
+		if self.player_thread != None:
+			self.player_thread.start()
+		outfile_regex = re.compile(r'^INFO: Outfile: (\S*)')
+		progress_regex = re.compile(r'^\[(\d+)/(\d+)\]')
+		error_regex = re.compile(r'^ERROR: (.*)')
+		while True:
+			# blocks until there is a job
+			url = self.job_queue.get()
+			if url.startswith('/'):
+				url = 'http://www.svtplay.se' + url
+			self.message = "Downloading {}".format(url)
+			self.current_job = url
+			self.progress = 0
+			cmd = ['/usr/bin/env', 'svtplay-dl', url]
+			with Popen(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True) as self.proc:
+				for line in iter(self.proc.stdout.readline, b''):
+					#line = line.decode('ascii')
+					line = line.strip("\r \n")
+					if line == '':
+						continue
+					m = outfile_regex.match(line)
+					if (not self.local_file) and m:
+						self.local_file = m.group(1)
+						self.message = "Downloading to local file: {}".format(self.local_file)
+						if self.player_thread != None:
+							self.player_thread.add_file(self.local_file)
+						continue
+					m = progress_regex.match(line)
+					if m:
+						a = int(m.group(1))
+						b = int(m.group(2))
+						self.progress = int(100 * a / b)
+						self.message = "{} ({}%) {}".format(m.group(0), self.progress, self.local_file)
+						if a == b:
+							break
+						continue
+					m = error_regex.match(line)
+					if m:
+						self.message = m.group(1)
+						continue
+					self.message = "Ignoring output '{}'".format(line)
+			self.message = "Download {} finished.".format(self.local_file)
+			self.done_queue.put((url, self.local_file))
+			self.current_job = None
+			self.local_file = None
+			self.progress = 0
+			self.proc = None
+
+import os.path
+import time
+class PlayerThread(Thread):
+	"""A thread that executes a player command and manages a queue of files to play"""
+
+	def __init__(self, player_command):
+		Thread.__init__(self)
+		self.daemon = True # thread dies with the program
+		self.player_command = player_command
+		self.play_queue = queue.Queue()
+		self.proc = None # currently running player
+
+	def add_file(self, file):
+		self.play_queue.put(file)
+
+	def run(self):
+		#subprocess.call('echo player-thread >> foo', shell=True)
+		while True:
+			# blocks until there is a job
+			file = self.play_queue.get()
+			subprocess.call('echo file-name {} >> ncsvtplay.debug'.format(file), shell=True)
+			while not os.path.isfile(file):
+				time.sleep(1)
+			subprocess.call('echo now playing {} >> ncsvtplay.debug'.format(file), shell=True)
+			cmd = "{} {} 2>&1 >> ncsvtplay.debug".format(self.player_command, file)
+			subprocess.call(cmd, shell=True) # stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+
+
+import curses
+import re
+import html
+
+import urllib.request
+import urllib.error
+
+import locale
+
+class StartPageParser():
+	def __init__(self):
+		genres = []
+		programmes = []
+		self.reload()
+
+	def _find_links(self, pattern, pagesource):
+		matchiter = re.finditer(pattern, pagesource)
+		return [(html.unescape(m.group('title')), html.unescape(m.group('url')))
+		        for m in matchiter]
+
+	def reload(self):
+		url = 'http://www.svtplay.se/program?genrer=visa'
+		pagesource = httpget(url)
+
+		# Find genre links
+		pattern = r'<a [^>]*?href="(?P<url>/genre/[^"]+)"[^>]*>(?P<title>[^<]+)</a>'
+		self.genres = self._find_links(pattern, pagesource)
+
+		# Programme links
+		pattern = r'<li class="play_alphabetic-list__item"[^>]*><a href="(?P<url>/(?!genre/)[^/"]+)"[^>]*>(?P<title>[^<]*)</a></li>'
+
+		self.programmes = self._find_links(pattern, pagesource)
+
+class GenrePageParser():
+	def __init__(self, url):
+		if url.startswith('/'):
+			url = 'http://www.svtplay.se' + url
+		self.url = url
+		self.links = []
+		self.reload()
+
+	def reload(self):
+		pagesourse = httpget(self.url)
+		pattern = r'<a href="(?!/sok)(?P<url>/[a-z0-9-]+)"[^>]*>\s*(?:</?\w\w.*?>\s*)*(?P<title>[A-Za-z0-9&][^<]*)(?:</?\w\w.*?>\s*)*(?:</?\w\w.*?>\s*)*</a>'
+		matchiter = re.finditer(pattern, pagesourse, re.DOTALL)
+		self.links = [(html.unescape(m.group('title')).strip(), html.unescape(m.group('url')))
+		              for m in matchiter]
+
+		pattern
+
+class ProgrammePageParser():
+	def __init__(self, url):
+		if url.startswith('/'):
+			url = 'http://www.svtplay.se' + url
+		self.url = url
+		self.links = []
+		self.reload()
+
+	def reload(self):
+		pagesourse = httpget(self.url)
+		pattern = r' class="play_vertical-list__header">\s*<a href="(?P<url>/video/\d+/.*?)" class="play_vertical-list__header-link">\s*(?P<title>[A-Za-z0-9&][^<]*)</a>\s*</h2>'
+		matchiter = re.finditer(pattern, pagesourse, re.DOTALL)
+		self.links = [(html.unescape(m.group('title')).strip(), html.unescape(m.group('url')))
+		              for m in matchiter]
+
+def httpget(url):
+	try:
+		return urllib.request.urlopen(url).read().decode('utf-8')
+	except urllib.error.HTTPError as e:
+		if (e.code == 404):
+			print("Not found")
+		else:
+			print("Unexpected HTTP Error {} for URL {}", e, url)
+			die()
+		return ""
+
+#from html.parser import HTMLParser
+#class EpisodePageParser(HTMLParser):
+#	"""Parser for a page of a single episode. Finds the RSS url."""
+#	rssURL = ""
+#	def handle_starttag(self, tag, attrs):
+#		if (tag != "link"):
+#			return
+#		attrd = dict(attrs)
+#		if (attrd["rel"] == "alternate" and attrd["type"] == "application/rss+xml"):
+#			self.rssURL = attrd["href"]
+
+#import xml.etree.ElementTree as ET
+#def get_all_episodes(url):
+#	"""Returns all episodes given the url of a single episode of a program"""
+#	html = httpget(url)
+#
+#	htmlparser = EpisodePageParser()
+#	htmlparser.feed(html)
+#	rssURL = htmlparser.rssURL
+#	rssdata = httpget(rssURL)
+#	tree = ET.fromstring(rssdata)
+#	rssitems = tree.findall('./channel/item')
+#	return [(item.find("link").text, item.find("title").text) for item in rssitems]
+
+class ScrollableView:
+	def __init__(self, window, items, heading):
+		self._window = window
+		self.heading = heading
+		if (len(items) == 0):
+			raise Exception("no items")
+		self.items = items
+		self.scroll_y = 0
+		self.selected_line = 0
+		self._enc = locale.getpreferredencoding()
+
+	def get_selected_title(self):
+		return self.items[self.selected_line][0]
+
+	def get_selected_url(self):
+		return self.items[self.selected_line][1]
+
+	def redraw(self):
+		# init scrollable pad
+		(self._max_y, self._max_x) = self._window.getmaxyx()
+		self.pad_height = self._max_y - 4
+		self._pad = curses.newpad(len(self.items), self._max_x)
+
+		# draw heading and lines
+		self._window.clear()
+		self._window.attron(curses.A_BOLD)
+		self._window.addstr(0, 0, self.heading)
+		self._window.attroff(curses.A_BOLD)
+		self._window.hline(1, 0, '-', self._max_x)
+		self._window.hline(self._max_y - 2, 0, '-', self._max_x)
+		self.redraw_scroll_pad()
+
+	def redraw_scroll_pad(self):
+		line = 0
+		for title, url in self.items:
+			label = title
+			if line == self.selected_line:
+				attr = curses.color_pair(1)
+			else:
+				attr = curses.color_pair(0)
+			self._pad.addstr(line, 0, label.encode(self._enc), attr)
+			line += 1
+		max_y = min(self._max_y - 3, len(self.items) + 1)
+		self._pad.overwrite(self._window, self.scroll_y, 0, 2, 0, max_y, self._max_x - 1)
+
+	def scroll(self, delta):
+		new_selected_line = self.selected_line + delta
+		if new_selected_line < 0:
+			new_selected_line = 0
+		elif new_selected_line > len(self.items) - 1:
+			new_selected_line = len(self.items) - 1
+		if self.selected_line == new_selected_line:
+			return
+		self.selected_line = new_selected_line
+		if (self.scroll_y > self.selected_line):
+			self.scroll_y = self.selected_line
+		elif (self.scroll_y < self.selected_line - self.pad_height + 1):
+			self.scroll_y = self.selected_line - self.pad_height + 1
+		self.redraw_scroll_pad()
+
+def svt_curses_main(window, player=None):
+	"""Main curses program to be called as curses.wrapper(svt_curses_main)"""
+
+	# Default messages
+	programmes_page_msg = '[a] Program A-Ö, [g] Genrer, [→] Öppna, [q] Avsluta'
+	genres_page_msg     = programmes_page_msg
+	genre_page_msg      = '[a] Program A-Ö, [g] Genrer, [→] Öppna, [←] Tillbaka, [q] Avsluta'
+	programme_page_msg  = '[a] Program A-Ö, [g] Genrer, [d] Download, [←] Tillbaka, [q] Avsluta'
+	loading_msg         = 'Laddar...'
+
+	# init stuff needed by helper functions
+	max_y, max_x = window.getmaxyx()
+	enc = locale.getpreferredencoding()
+
+	# helper functions
+	def set_message(msg):
+		if msg == '':
+			if view == programmes_view:
+				msg = programmes_page_msg
+			elif view == genres_view:
+				msg = genres_page_msg
+			elif current_programme != None:
+				msg = programme_page_msg
+			else:
+				msg = genre_page_msg
+		window.hline(max_y - 1, 0, ' ', max_x)
+		window.addstr(max_y - 1, 0, msg.encode(enc, 'replace'))
+
+	curses.curs_set(False)
+	curses.start_color()
+	curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_RED)
+	window.addstr(0, 0, "Ncurses SVT Play Client".encode(enc, 'replace'), curses.A_BOLD)
+	set_message(loading_msg)
+	window.refresh()
+
+	# state variables
+	current_programme = None
+	path = []
+
+	# cache
+	programme_view_mapping = {}
+	genre_view_mapping = {}
+	url_to_file_dict = dict()
+
+	# start dl thread
+	dl_thread = SvtplayDlThread(player)
+	dl_thread.start()
+
+	# load start pages: programmes and genres
+	start_page_parser = StartPageParser()
+	programmes_view = ScrollableView(window, start_page_parser.programmes, 'SVT Play: Program A-Ö')
+	genres_view = ScrollableView(window, start_page_parser.genres, 'SVT Play: Genrer')
+
+	# set initial state
+	window.timeout(1000)
+	view = programmes_view
+	view.redraw()
+	set_message('')
+	while True:
+		window.refresh()
+		k = window.getch() # blocks for some time
+		if k == -1:
+			# timeout
+			set_message(dl_thread.message)
+		elif k == curses.KEY_RESIZE:
+			view.redraw()
+			max_y, max_x = window.getmaxyx()
+		elif k == curses.KEY_UP:
+			view.scroll(-1)
+		elif k == curses.KEY_DOWN:
+			view.scroll(1)
+		elif k == curses.KEY_PPAGE:
+			view.scroll(-max_y + 4)
+		elif k == curses.KEY_NPAGE:
+			view.scroll(max_y - 4)
+		elif (k == curses.KEY_RIGHT or k == ord("\n")) and view == genres_view:
+			url = view.get_selected_url()
+			if url in genre_view_mapping:
+				view = genre_view_mapping[url]
+			else:
+				set_message(loading_msg)
+				window.refresh()
+				genre_page_parser = GenrePageParser(url + '?sida=999')
+				links = genre_page_parser.links
+				if len(links) == 0:
+					links = [("(inga program)", None)]
+				title = view.get_selected_title()
+				view = ScrollableView(window, links, title)
+				genre_view_mapping[url] = view
+			path.append(genres_view)
+			view.redraw()
+			set_message('')
+		elif (k == curses.KEY_RIGHT or k == ord("\n")) and current_programme == None:
+			# We are on the programmes view or a genre view. The selected URL is to a programme page.
+			url = view.get_selected_url()
+			if url == None:
+				continue
+			path.append(view) # for going back
+			if url in programme_view_mapping:
+				view = programme_view_mapping[url]
+			else:
+				set_message(loading_msg)
+				window.refresh()
+				program_page_parser = ProgrammePageParser(url + '?sida=999')
+				title = view.get_selected_title()
+				view = ScrollableView(window, program_page_parser.links, title)
+				programme_view_mapping[url] = view
+			current_programme = True # we don't actually need to know which here...
+			view.redraw()
+			set_message('')
+		elif k == ord('a') and view != programmes_view:
+			view = programmes_view
+			view.redraw()
+			current_programme = None
+			path = []
+			set_message('')
+		elif k == curses.KEY_LEFT and len(path) > 0:
+			view = path.pop()
+			view.redraw()
+			current_programme = None
+			set_message('')
+		elif k == ord('g') and view != genres_view:
+			view = genres_view
+			view.redraw()
+			path = []
+			current_programme = None
+			set_message('')
+		elif k == ord('q'):
+			dl_thread.kill_current()
+			break
+		elif (k == ord('d') or k == ord("\n")) and current_programme != None:
+			url = view.get_selected_url()
+			set_message('Download ' + url)
+			dl_thread.add_job(url)
+
+import getopt
+if __name__ == "__main__":
+	locale.setlocale(locale.LC_ALL, '')
+	try:
+		opts, args = getopt.getopt(sys.argv[1:], "p:")
+	except getopt.GetoptError as err:
+		# print help information and exit:
+		print(err) # will print something like "option -a not recognized"
+		print("Usage: {} [-p PLAYER-COMMAND]\n".format(sys.argv[0]))
+		sys.exit(2)
+	player = None
+	for o, a in opts:
+		if o == "-p":
+			player = a
+		else:
+			print("Usage: {} [-p PLAYER-COMMAND]\n".format(sys.argv[0]))
+			sys.exit(2)
+	curses.wrapper(lambda window: svt_curses_main(window, player))
