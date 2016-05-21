@@ -29,125 +29,113 @@ import sys
 import subprocess
 from subprocess import PIPE, Popen
 from threading  import Thread
-import queue
+from queue import Queue
+from multiprocessing import Lock
+
+from collections import deque
+
 import re
 import os
 class SvtplayDlThread(Thread):
 	"""A thread that executes svtplay-dl and monitors its output"""
 
-	# TODO: For displaying the queue, use locks and deque instead of queue.Queue
-
-	def __init__(self, player):
+	def __init__(self):
 		Thread.__init__(self)
 		self.daemon = True # thread dies with the program
-		self.job_queue = queue.Queue()
-		self.done_queue = queue.Queue()
-		self.current_job = None
+		self.mutex = Lock()
+		self.worker_wakeup_queue = Queue() # pushing anything here wakes the worker
+		self.job_queue = deque()
+		self.done_queue = deque()
 		self.message = ''
 		self.proc = None
-		self.local_file = None
-		self.player_thread = None
-		if player != None:
-			self.player_thread = PlayerThread(player)
+		self.local_files = []
 
 	def add_job(self, url):
-		self.job_queue.put(url)
+		with self.mutex:
+			self.job_queue.append(url)
+			self.worker_wakeup_queue.put(True)
 
 	def kill_current(self):
-		"""Kills currently running job (not thread safe...)"""
-		if self.proc:
-			self.proc.kill()
-		if self.local_file:
-			os.remove(self.local_file)
-		self.local_file = None
-		self.current_job = None
-		self.proc = None
+		"""Kills currently running job"""
+		with self.mutex:
+			if self.proc:
+				self.proc.kill()
+			for f in self.local_files:
+				os.remove(f)
+			self.local_files = []
+			self.proc = None
 
 	def fetch_done_jobs(self):
 		jobs = []
-		while True:
-			try:
-				job = self.done_queue.get_nowait()
-			except queue.Empty:
-				return jobs
-			else:
+		with self.mutex:
+			for job in self.done_queue:
 				jobs.append(job)
+		return jobs
 
 	def run(self):
-		if self.player_thread != None:
-			self.player_thread.start()
 		outfile_regex = re.compile(r'^INFO: Outfile: (\S*)')
 		progress_regex = re.compile(r'^\[(\d+)/(\d+)\]')
+		merge_regex = re.compile(r'INFO: Merge audio and video into (\S*)')
 		error_regex = re.compile(r'^ERROR: (.*)')
 		while True:
 			# blocks until there is a job
-			url = self.job_queue.get()
+			while self.worker_wakeup_queue.get():
+				with self.mutex:
+					if len(self.job_queue) > 0:
+						url = self.job_queue.popleft()
+						break
+					else:
+						# The queue job queue is empty. Maybe the user has deleted
+						# stuff from the queue. Wait again.
+						continue
+
 			if url.startswith('/'):
 				url = 'http://www.svtplay.se' + url
 			self.message = "Downloading {}".format(url)
-			self.current_job = url
-			self.progress = 0
+			with self.mutex:
+				self.local_files = []
 			cmd = ['/usr/bin/env', 'svtplay-dl', url]
-			with Popen(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1, universal_newlines=True) as self.proc:
-				for line in iter(self.proc.stdout.readline, b''):
-					#line = line.decode('ascii')
-					line = line.strip("\r \n")
-					if line == '':
-						continue
-					m = outfile_regex.match(line)
-					if (not self.local_file) and m:
-						self.local_file = m.group(1)
-						self.message = "Downloading to local file: {}".format(self.local_file)
-						if self.player_thread != None:
-							self.player_thread.add_file(self.local_file)
-						continue
-					m = progress_regex.match(line)
-					if m:
-						a = int(m.group(1))
-						b = int(m.group(2))
-						self.progress = int(100 * a / b)
-						self.message = "{} ({}%) {}".format(m.group(0), self.progress, self.local_file)
-						if a == b:
-							break
-						continue
-					m = error_regex.match(line)
-					if m:
-						self.message = m.group(1)
-						continue
-					self.message = "svtplay-dl: {}".format(line)
-			self.message = "Download {} finished.".format(self.local_file)
-			self.done_queue.put((url, self.local_file))
-			self.current_job = None
-			self.local_file = None
-			self.progress = 0
-			self.proc = None
-
-import os.path
-import time
-class PlayerThread(Thread):
-	"""A thread that executes a player command and manages a queue of files to play"""
-
-	def __init__(self, player_command):
-		Thread.__init__(self)
-		self.daemon = True # thread dies with the program
-		self.player_command = player_command
-		self.play_queue = queue.Queue()
-		self.proc = None # currently running player
-
-	def add_file(self, file):
-		self.play_queue.put(file)
-
-	def run(self):
-		#subprocess.call('echo player-thread >> foo', shell=True)
-		while True:
-			# blocks until there is a job
-			file = self.play_queue.get()
-			subprocess.call('echo file-name {} >> ncsvtplay.debug'.format(file), shell=True)
-			while not os.path.isfile(file):
-				time.sleep(1)
-			subprocess.call('echo now playing {} >> ncsvtplay.debug'.format(file), shell=True)
-			cmd = "{} {} 2>&1 >> ncsvtplay.debug".format(self.player_command, file)
-			subprocess.call(cmd, shell=True) # stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+			current_file = None
+			with Popen(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1,
+			           universal_newlines=True) as self.proc:
+				for line in self.proc.stdout:
+					with self.mutex:
+						#line = line.decode('ascii')
+						line = line.strip("\r \n")
+						if line == '':
+							continue
+						m = outfile_regex.match(line)
+						if m:
+							current_file = m.group(1)
+							self.local_files.append(current_file)
+							self.message = "Downloading {}".format(current_file)
+							continue
+						m = progress_regex.match(line)
+						if m:
+							a = int(m.group(1))
+							b = int(m.group(2))
+							progress = int(100 * a / b)
+							self.message = "{} ({}%) {}".format(m.group(0),
+							                                    progress,
+							                                    current_file)
+							#if a == b:
+							#	break
+							continue
+						m = merge_regex.match(line)
+						if m:
+							current_file = m.group(1)
+							self.message = "Merging audio and video."
+							continue
+						m = error_regex.match(line)
+						if m:
+							self.message = m.group(1)
+							continue
+						self.message = "{}".format(line)
+			with self.mutex:
+				self.message = "Download {} finished.".format(current_file)
+				self.done_queue.append((url, current_file))
+				self.local_files = []
+				self.proc = None
 
 
 import curses
@@ -310,7 +298,7 @@ class ScrollableView:
 			self.scroll_y = self.selected_line - self.pad_height + 1
 		self.redraw_scroll_pad()
 
-def svt_curses_main(window, player=None):
+def svt_curses_main(window, output=None):
 	"""Main curses program to be called as curses.wrapper(svt_curses_main)"""
 
 	# Default messages
@@ -359,7 +347,7 @@ def svt_curses_main(window, player=None):
 	url_to_file_dict = dict()
 
 	# start dl thread
-	dl_thread = SvtplayDlThread(player)
+	dl_thread = SvtplayDlThread()
 	dl_thread.start()
 
 	# load start pages: programmes and genres
@@ -448,22 +436,29 @@ def svt_curses_main(window, player=None):
 			url = view.get_selected_url()
 			set_message('Download ' + url)
 			dl_thread.add_job(url)
+		elif output != None and k == ord('o') and current_programme != None:
+			url = view.get_selected_url()
+			if url.startswith('/'):
+				url = 'http://www.svtplay.se' + url
+			set_message('Saving URL to file')
+			with open(output, "a") as urlfile:
+				urlfile.write("{}\n".format(url))
 
 import getopt
 if __name__ == "__main__":
 	locale.setlocale(locale.LC_ALL, '')
 	try:
-		opts, args = getopt.getopt(sys.argv[1:], "p:")
+		opts, args = getopt.getopt(sys.argv[1:], "p:o:")
 	except getopt.GetoptError as err:
 		# print help information and exit:
 		print(err) # will print something like "option -a not recognized"
-		print("Usage: {} [-p PLAYER-COMMAND]\n".format(sys.argv[0]))
+		print("Usage: {}\n".format(sys.argv[0]))
 		sys.exit(2)
-	player = None
+	output = None
 	for o, a in opts:
-		if o == "-p":
-			player = a
+		if o == "-o":
+			output = a
 		else:
-			print("Usage: {} [-p PLAYER-COMMAND]\n".format(sys.argv[0]))
+			print("Usage: {}\n".format(sys.argv[0]))
 			sys.exit(2)
-	curses.wrapper(lambda window: svt_curses_main(window, player))
+	curses.wrapper(lambda window: svt_curses_main(window, output))
