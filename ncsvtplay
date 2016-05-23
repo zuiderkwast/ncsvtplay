@@ -100,7 +100,6 @@ class SvtplayDlThread(Thread):
 			           universal_newlines=True) as self.proc:
 				for line in self.proc.stdout:
 					with self.mutex:
-						#line = line.decode('ascii')
 						line = line.strip("\r \n")
 						if line == '':
 							continue
@@ -118,8 +117,6 @@ class SvtplayDlThread(Thread):
 							self.message = "{} ({}%) {}".format(m.group(0),
 							                                    progress,
 							                                    current_file)
-							#if a == b:
-							#	break
 							continue
 						m = merge_regex.match(line)
 						if m:
@@ -155,7 +152,8 @@ class StartPageParser():
 
 	def _find_links(self, pattern, pagesource):
 		matchiter = re.finditer(pattern, pagesource)
-		return [(html.unescape(m.group('title')), html.unescape(m.group('url')))
+		return [{"title": html.unescape(m.group('title')),
+		         "url": html.unescape(m.group('url'))}
 		        for m in matchiter]
 
 	def reload(self):
@@ -183,7 +181,8 @@ class GenrePageParser():
 		pagesourse = httpget(self.url)
 		pattern = r'<a href="(?!/sok)(?P<url>/[a-z0-9-]+)"[^>]*>\s*(?:</?\w\w.*?>\s*)*(?P<title>[A-Za-z0-9&][^<]*)(?:</?\w\w.*?>\s*)*(?:</?\w\w.*?>\s*)*</a>'
 		matchiter = re.finditer(pattern, pagesourse, re.DOTALL)
-		self.links = [(html.unescape(m.group('title')).strip(), html.unescape(m.group('url')))
+		self.links = [{"title": html.unescape(m.group('title')).strip(),
+		               "url": html.unescape(m.group('url'))}
 		              for m in matchiter]
 
 		pattern
@@ -197,11 +196,25 @@ class ProgrammePageParser():
 		self.reload()
 
 	def reload(self):
-		pagesourse = httpget(self.url)
-		pattern = r' class="play_vertical-list__header">\s*<a href="(?P<url>/video/\d+/.*?)" class="play_vertical-list__header-link">\s*(?P<title>[A-Za-z0-9&][^<]*)</a>\s*</h2>'
-		matchiter = re.finditer(pattern, pagesourse, re.DOTALL)
-		self.links = [(html.unescape(m.group('title')).strip(), html.unescape(m.group('url')))
-		              for m in matchiter]
+		pagesource = httpget(self.url)
+		block_p = r'<li class="play_vertical-list__item play_js-vertical-list-item">(.*?)</li>'
+		link_p = r' class="play_vertical-list__header">\s*<a href="(?P<url>/video/\d+/.*?)" class="play_vertical-list__header-link">\s*(?P<title>[A-Za-z0-9&][^<]*)</a>\s*</h2>'
+		#time_p = r'<time>([^<]*)</time>'
+		#pub_p = r'>\s*Publicerades\s+([^<]*)<'
+		desc_p = r'<p class="play_vertical-list__description-text">([^<]*)</p>'
+		links = []
+		for block_m in re.finditer(block_p, pagesource, re.DOTALL):
+			block = block_m.group(1)
+			link_match = re.search(link_p, block, re.DOTALL)
+			if not link_match:
+				continue
+			title = html.unescape(link_match.group('title')).strip()
+			url = html.unescape(link_match.group('url')).strip()
+			desc_m = re.search(desc_p, block)
+			desc =  html.unescape(desc_m.group(1)).strip() if desc_m else ''
+			ep = {"title": title, "url": url, "desc": desc}
+			links.append(ep)
+		self.links = links
 
 def httpget(url):
 	try:
@@ -236,7 +249,7 @@ def httpget(url):
 #	rssdata = httpget(rssURL)
 #	tree = ET.fromstring(rssdata)
 #	rssitems = tree.findall('./channel/item')
-#	return [(item.find("link").text, item.find("title").text) for item in rssitems]
+#	return [{"title": item.find("link").text, "url": item.find("title").text} for item in rssitems]
 
 class ScrollableView:
 	def __init__(self, window, items, heading):
@@ -250,10 +263,10 @@ class ScrollableView:
 		self._enc = locale.getpreferredencoding()
 
 	def get_selected_title(self):
-		return self.items[self.selected_line][0]
+		return self.items[self.selected_line]['title']
 
 	def get_selected_url(self):
-		return self.items[self.selected_line][1]
+		return self.items[self.selected_line]['url']
 
 	def redraw(self):
 		# init scrollable pad
@@ -263,22 +276,32 @@ class ScrollableView:
 
 		# draw heading and lines
 		self._window.clear()
-		self._window.attron(curses.A_BOLD)
-		self._window.addstr(0, 0, self.heading)
-		self._window.attroff(curses.A_BOLD)
-		self._window.hline(1, 0, '-', self._max_x)
-		self._window.hline(self._max_y - 2, 0, '-', self._max_x)
+		self._window.addstr(0, 0, self.heading, curses.A_BOLD | curses.color_pair(1))
+		self._window.hline(1, 0, '-', self._max_x, curses.color_pair(1))
+		self._window.hline(self._max_y - 2, 0, '-', self._max_x, curses.color_pair(1))
 		self.redraw_scroll_pad()
 
 	def redraw_scroll_pad(self):
 		line = 0
-		for title, url in self.items:
-			label = title
+		for item in self.items:
+			label = item['title'][:self._max_x - 1]
 			if line == self.selected_line:
-				attr = curses.color_pair(1)
+				attr = curses.color_pair(2)
 			else:
-				attr = curses.color_pair(0)
-			self._pad.addstr(line, 0, label.encode(self._enc), attr)
+				attr = curses.color_pair(1)
+			self._pad.addstr(line, 0, label.encode(self._enc, 'replace'),
+			                 attr | curses.A_BOLD)
+			# Description if any and if there is space
+			if 'desc' in item:
+				desc = (' - ' + item['desc'])[:self._max_x - 1 - len(label)]
+			else:
+				desc = ''
+			# Add padding to desc
+			padding = self._max_x - len(desc) - len(label) - 1
+			if padding > 0:
+				desc += ' ' * padding
+			self._pad.addstr(line, len(label), desc.encode(self._enc, 'replace'),
+			                 attr)
 			line += 1
 		max_y = min(self._max_y - 3, len(self.items) + 1)
 		self._pad.overwrite(self._window, self.scroll_y, 0, 2, 0, max_y, self._max_x - 1)
@@ -298,7 +321,7 @@ class ScrollableView:
 			self.scroll_y = self.selected_line - self.pad_height + 1
 		self.redraw_scroll_pad()
 
-def svt_curses_main(window, output=None):
+def svt_curses_main(window, debug_on=False, output=None):
 	"""Main curses program to be called as curses.wrapper(svt_curses_main)"""
 
 	# Default messages
@@ -323,17 +346,31 @@ def svt_curses_main(window, output=None):
 				msg = programme_page_msg
 			else:
 				msg = genre_page_msg
-		window.hline(max_y - 1, 0, ' ', max_x)
+		window.hline(max_y - 1, 0, ' ', max_x, curses.color_pair(1))
+		msg = msg[:max_x - 1]
 		try:
-			window.addstr(max_y - 1, 0, msg.encode(enc, 'replace'))
+			window.addstr(max_y - 1, 0, msg.encode(enc, 'replace'),
+			              curses.color_pair(1))
 		except:
 			pass
 
+	def debug(msg):
+		if debug_on:
+			with open("ncsvtplay.debug", "a") as f:
+				f.write("{}\n".format(msg))
+		else:
+			pass
 
 	curses.curs_set(False)
 	curses.start_color()
-	curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_RED)
-	window.addstr(0, 0, "Ncurses SVT Play Client".encode(enc, 'replace'), curses.A_BOLD)
+	curses.use_default_colors()
+
+	curses.init_pair(1, -1, -1)
+	curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_CYAN)
+	curses.init_pair(3, curses.COLOR_BLUE, -1)
+	curses.init_pair(4, curses.COLOR_BLUE, curses.COLOR_CYAN)
+	window.addstr(0, 0, "Ncurses SVT Play Client".encode(enc, 'replace'),
+	              curses.A_BOLD | curses.color_pair(1))
 	set_message(loading_msg)
 	window.refresh()
 
@@ -395,7 +432,8 @@ def svt_curses_main(window, output=None):
 			view.redraw()
 			set_message('')
 		elif (k == curses.KEY_RIGHT or k == ord("\n")) and current_programme == None:
-			# We are on the programmes view or a genre view. The selected URL is to a programme page.
+			# We are on the programmes view or a genre view.
+			# The selected URL is to a programme page.
 			url = view.get_selected_url()
 			if url == None:
 				continue
@@ -448,17 +486,20 @@ import getopt
 if __name__ == "__main__":
 	locale.setlocale(locale.LC_ALL, '')
 	try:
-		opts, args = getopt.getopt(sys.argv[1:], "p:o:")
+		opts, args = getopt.getopt(sys.argv[1:], "p:o:d")
 	except getopt.GetoptError as err:
 		# print help information and exit:
 		print(err) # will print something like "option -a not recognized"
 		print("Usage: {}\n".format(sys.argv[0]))
 		sys.exit(2)
 	output = None
+	debug = False
 	for o, a in opts:
 		if o == "-o":
 			output = a
+		elif o == '-d':
+			debug = True
 		else:
 			print("Usage: {}\n".format(sys.argv[0]))
 			sys.exit(2)
-	curses.wrapper(lambda window: svt_curses_main(window, output))
+	curses.wrapper(lambda window: svt_curses_main(window, debug, output))
