@@ -50,9 +50,9 @@ class SvtplayDlThread(Thread):
 		self.proc = None
 		self.local_files = []
 
-	def add_job(self, url):
+	def add_job(self, url, subdir):
 		with self.mutex:
-			self.job_queue.append(url)
+			self.job_queue.append((url, subdir))
 			self.worker_wakeup_queue.put(True)
 
 	def kill_current(self):
@@ -82,7 +82,7 @@ class SvtplayDlThread(Thread):
 			while self.worker_wakeup_queue.get():
 				with self.mutex:
 					if len(self.job_queue) > 0:
-						url = self.job_queue.popleft()
+						(url, subdir) = self.job_queue.popleft()
 						break
 					else:
 						# The queue job queue is empty. Maybe the user has deleted
@@ -96,6 +96,8 @@ class SvtplayDlThread(Thread):
 				self.local_files = []
 			cmd = ['/usr/bin/env', 'svtplay-dl', url]
 			current_file = None
+			os.makedirs(subdir, exist_ok=True)
+			os.chdir(subdir)
 			with Popen(cmd, stdout=PIPE, stderr=subprocess.STDOUT, bufsize=1,
 			           universal_newlines=True) as self.proc:
 				for line in self.proc.stdout:
@@ -130,9 +132,10 @@ class SvtplayDlThread(Thread):
 						self.message = "{}".format(line)
 			with self.mutex:
 				self.message = "Download {} finished.".format(current_file)
-				self.done_queue.append((url, current_file))
+				self.done_queue.append((url, "{}/{}".format(subdir, current_file)))
 				self.local_files = []
 				self.proc = None
+				os.chdir('..')
 
 
 import curses
@@ -440,6 +443,7 @@ def svt_curses_main(window, debug_on=False, output=None):
 			url = view.get_selected_url()
 			if url == None:
 				continue
+			current_programme = view.get_selected_title()
 			path.append(view) # for going back
 			if url in programme_view_mapping:
 				view = programme_view_mapping[url]
@@ -450,7 +454,6 @@ def svt_curses_main(window, debug_on=False, output=None):
 				title = view.get_selected_title()
 				view = ScrollableView(window, program_page_parser.links, title)
 				programme_view_mapping[url] = view
-			current_programme = True # we don't actually need to know which here...
 			view.redraw()
 			set_message('')
 		elif k == ord('a') and view != programmes_view:
@@ -476,7 +479,9 @@ def svt_curses_main(window, debug_on=False, output=None):
 		elif (k == ord('d') or k == ord("\n")) and current_programme != None:
 			url = view.get_selected_url()
 			set_message('Download ' + url)
-			dl_thread.add_job(url)
+			trans = str.maketrans('åäàéèêö– ','aaaeeeo-_', '?!.,:')
+			subdir = current_programme.lower().translate(trans)
+			dl_thread.add_job(url, subdir)
 		elif output != None and k == ord('o') and current_programme != None:
 			url = view.get_selected_url()
 			if url.startswith('/'):
