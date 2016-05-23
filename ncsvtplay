@@ -203,12 +203,15 @@ class ProgrammePageParser():
 		#pub_p = r'>\s*Publicerades\s+([^<]*)<'
 		desc_p = r'<p class="play_vertical-list__description-text">([^<]*)</p>'
 		links = []
+		ignore_p = r' syntolkat'
 		for block_m in re.finditer(block_p, pagesource, re.DOTALL):
 			block = block_m.group(1)
 			link_match = re.search(link_p, block, re.DOTALL)
 			if not link_match:
 				continue
 			title = html.unescape(link_match.group('title')).strip()
+			if re.search(ignore_p, block): # ignore certain titles
+				continue
 			url = html.unescape(link_match.group('url')).strip()
 			desc_m = re.search(desc_p, block)
 			desc =  html.unescape(desc_m.group(1)).strip() if desc_m else ''
